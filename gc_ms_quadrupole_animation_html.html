@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>GC-MS Quadrupole Animation (Colorful, Faster Last 3)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root{
+    --bg1:#f6f9ff; --bg2:#fff5f8; --ink:#142034; --panel:#ffffff; --border:#b9c7e3;
+  }
+  html,body{margin:0;padding:0;height:100%;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:var(--ink);}
+  body{background: radial-gradient(1200px 600px at 10% 0%, var(--bg2), transparent 60%),
+                     radial-gradient(1200px 800px at 100% 100%, #eef6ff, transparent 55%),
+                     var(--bg1);}  
+  .wrap{max-width:1320px;margin:0 auto;padding:10px 16px}
+  .toolbar{display:flex;gap:10px;justify-content:center;margin:12px 0}
+  .btn{border:1px solid #9ab;background:#fff;padding:8px 16px;border-radius:12px;cursor:pointer;font-weight:700;box-shadow:0 2px 8px rgba(0,0,0,.05)}
+  #canvas{display:block;margin:10px auto;border:2px solid var(--border);border-radius:18px;background:linear-gradient(180deg,#ffffff 0%,#f7fbff 100%);box-shadow:0 8px 24px rgba(20,40,80,.12)}
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="toolbar">
+  <button class="btn" id="toggle">⏸ Pause</button>
+  <button class="btn" id="reset">↺ Restart</button>
+</div>
+<canvas id="canvas" width="1280" height="460"></canvas>
+</div>
+<script>
+const canvas=document.getElementById('canvas'),ctx=canvas.getContext('2d');
+const btnToggle=document.getElementById('toggle'),btnReset=document.getElementById('reset');
+const panels={ion:{x:16,y:16,w:300,h:428,title:'Ionization Chamber'},quad:{x:336,y:16,w:320,h:428,title:'Quadrupole Mass Filter'},det:{x:676,y:16,w:250,h:428,title:'Ion Detector'},spec:{x:948,y:16,w:316,h:428,title:'Mass Spectrum'}};
+// Brighter, more playful palette for fragment ions
+const COLORS=['#3b82f6','#ef4444','#10b981','#f59e0b','#a855f7'];
+const NOISE_COLOR='#9aa3af';
+const BASE_MZ=[33,41,47,58,72];
+let spectrum={},displaySpectrum={},ions=[],paused=false,tGlobal=0,currentMzIndex=0,cycleTimer=0,autoTimer=0;
+// Glow effects for rod collisions
+let glows=[]; // {x,y,life}
+function addGlow(x,y){ glows.push({x,y,life:1}); }
+function drawGlows(){
+  for(let i=glows.length-1;i>=0;i--){
+    const g=glows[i];
+    const r=12 + (1-g.life)*22;
+    const grad=ctx.createRadialGradient(g.x,g.y,2,g.x,g.y,r);
+    grad.addColorStop(0,`rgba(120,160,255,${0.55*g.life})`);
+    grad.addColorStop(0.6,`rgba(120,160,255,${0.25*g.life})`);
+    grad.addColorStop(1,'rgba(120,160,255,0)');
+    ctx.save(); ctx.fillStyle=grad; ctx.beginPath(); ctx.arc(g.x,g.y,r,0,Math.PI*2); ctx.fill(); ctx.restore();
+    g.life -= 0.05; if(g.life<=0){ glows.splice(i,1); }
+  }
+}
+// Timing: first two m/z ~3s each; last three faster (~1.3s each)
+function currentCycleFrames(){ return (currentMzIndex < 2) ? 180 : 78; }
+function seedSpectrum(){spectrum={};displaySpectrum={};BASE_MZ.forEach(m=>{spectrum[m]=0;displaySpectrum[m]=0;});}
+function createIons(){ions=[];const grid=[{x:panels.ion.x+90,y:panels.ion.y+120},{x:panels.ion.x+210,y:panels.ion.y+120},{x:panels.ion.x+90,y:panels.ion.y+280},{x:panels.ion.x+210,y:panels.ion.y+280}];
+for(let g=0;g<4;g++){
+  for(let j=0;j<BASE_MZ.length;j++){
+    ions.push({mz:BASE_MZ[j],color:COLORS[j%COLORS.length],cx:grid[g].x,cy:grid[g].y,x:grid[g].x,y:grid[g].y,angle:(-0.9+j*0.45),stage:'inChamber',t:0,alpha:1,isNoise:false});
+  }
+  for(let n=0;n<2;n++){
+    const noiseMz=Math.floor(Math.random()*80)+20;
+    ions.push({mz:noiseMz,color:NOISE_COLOR,cx:grid[g].x,cy:grid[g].y,x:grid[g].x,y:grid[g].y,angle:(Math.random()*Math.PI*2-1),stage:'inChamber',t:0,alpha:1,isNoise:true});
+  }
+}}
+function currentMz(){return BASE_MZ[currentMzIndex];}
+function nextMz(){currentMzIndex=(currentMzIndex+1)%BASE_MZ.length;}
+function allBaseIonsCounted(){return ions.filter(i=>!i.isNoise).every(i=>i.stage==='counted');}
+function drawPanel(p){ctx.save();
+  // Colorful header stripe
+  ctx.strokeStyle=getComputedStyle(document.documentElement).getPropertyValue('--border')||'#b9c7e3';
+  ctx.lineWidth=2; ctx.fillStyle='#fff';
+  ctx.beginPath(); roundRect(ctx,p.x,p.y,p.w,p.h,18); ctx.fill(); ctx.stroke();
+  const hdrGrad=ctx.createLinearGradient(p.x,p.y,p.x+p.w,p.y);
+  hdrGrad.addColorStop(0,'rgba(59,130,246,.18)');
+  hdrGrad.addColorStop(0.5,'rgba(16,185,129,.18)');
+  hdrGrad.addColorStop(1,'rgba(239,68,68,.18)');
+  ctx.fillStyle=hdrGrad; roundRect(ctx,p.x+8,p.y+8,p.w-16,36,12); ctx.fill();
+  ctx.fillStyle='#10223a'; ctx.font='700 15px system-ui'; ctx.fillText(p.title,p.x+18,p.y+32);
+  ctx.restore();
+}
+function roundRect(c,x,y,w,h,r){c.moveTo(x+r,y);c.arcTo(x+w,y,x+w,y+h,r);c.arcTo(x+w,y+h,x,y+h,r);c.arcTo(x,y+h,x,y,r);c.arcTo(x,y,x+w,y,r);}
+function drawMolecules(){const mols=[{x:panels.ion.x+90,y:panels.ion.y+120},{x:panels.ion.x+210,y:panels.ion.y+120},{x:panels.ion.x+90,y:panels.ion.y+280},{x:panels.ion.x+210,y:panels.ion.y+280}];mols.forEach((m,i)=>{ctx.save();ctx.translate(m.x,m.y);ctx.beginPath();ctx.arc(0,0,30,0,Math.PI*2);ctx.fillStyle=['#fde68a','#c7d2fe','#bbf7d0','#fecaca'][i%4];ctx.strokeStyle='#8b8f98';ctx.lineWidth=1.5;ctx.stroke();ctx.beginPath();ctx.arc(0,0,10,0,Math.PI*2);ctx.fillStyle='rgba(255,255,255,.85)';ctx.fill();ctx.restore();});}
+function drawIon(ion){ctx.save();ctx.globalAlpha=ion.alpha;ctx.beginPath();ctx.arc(ion.x,ion.y,11.5,0,Math.PI*2);ctx.fillStyle=ion.color;ctx.shadowColor='rgba(0,0,0,.15)';ctx.shadowBlur=8;ctx.fill();ctx.shadowBlur=0;ctx.lineWidth=1.6;ctx.strokeStyle='rgba(0,0,0,.35)';ctx.stroke();if(!ion.isNoise){ctx.fillStyle='#fff';ctx.font='bold 11px system-ui';ctx.fillText(String(ion.mz),ion.x-ctx.measureText(String(ion.mz)).width/2,ion.y+4);}ctx.restore();}
+function drawQuad(){const q=panels.quad;const midY=q.y+q.h/2;const left=q.x+26,right=q.x+q.w-26;const rodOffset=28;ctx.save();
+  // Make rods colorful
+  const grad1=ctx.createLinearGradient(left,midY-rodOffset,right,midY-rodOffset); grad1.addColorStop(0,'#60a5fa'); grad1.addColorStop(1,'#34d399');
+  const grad2=ctx.createLinearGradient(left,midY+rodOffset,right,midY+rodOffset); grad2.addColorStop(0,'#f472b6'); grad2.addColorStop(1,'#f59e0b');
+  const grad3=ctx.createLinearGradient(left,midY-rodOffset*2,right,midY-rodOffset*2); grad3.addColorStop(0,'#a78bfa'); grad3.addColorStop(1,'#22d3ee');
+  const grad4=ctx.createLinearGradient(left,midY+rodOffset*2,right,midY+rodOffset*2); grad4.addColorStop(0,'#f87171'); grad4.addColorStop(1,'#34d399');
+  ctx.lineWidth=10; ctx.strokeStyle=grad1; ctx.beginPath(); ctx.moveTo(left,midY-rodOffset); ctx.lineTo(right,midY-rodOffset); ctx.stroke();
+  ctx.strokeStyle=grad2; ctx.beginPath(); ctx.moveTo(left,midY+rodOffset); ctx.lineTo(right,midY+rodOffset); ctx.stroke();
+  ctx.strokeStyle=grad3; ctx.beginPath(); ctx.moveTo(left,midY-rodOffset*2); ctx.lineTo(right,midY-rodOffset*2); ctx.stroke();
+  ctx.strokeStyle=grad4; ctx.beginPath(); ctx.moveTo(left,midY+rodOffset*2); ctx.lineTo(right,midY+rodOffset*2); ctx.stroke();
+  // current m/z indicator
+  ctx.fillStyle='#0f172a'; ctx.font='800 18px system-ui'; const txt=`Filtering: m/z ${currentMz()}`; ctx.fillText(txt,q.x+q.w/2-ctx.measureText(txt).width/2,q.y+60);
+  ctx.restore();}
+function drawDetector(){const d=panels.det;const cx=d.x+d.w/2,cy=d.y+d.h/2;ctx.save();ctx.beginPath();ctx.arc(cx,cy,42,0,Math.PI*2);ctx.fillStyle='#eef6ff';ctx.strokeStyle='#93c5fd';ctx.lineWidth=6;ctx.fill();ctx.stroke();ctx.fillStyle='#1e293b';ctx.font='900 15px system-ui';ctx.fillText('DETECTOR',cx-42,cy+5);ctx.restore();}
+function drawSpectrum(){const s=panels.spec;const x0=s.x+24,y0=s.y+s.h-40,w=s.w-48,h=s.h-80;ctx.save();ctx.strokeStyle='#b8c4d4';ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(x0,y0);ctx.lineTo(x0+w,y0);ctx.lineTo(x0+w,y0-h);ctx.stroke();const barW=Math.min(22,Math.floor(w/BASE_MZ.length)-8);BASE_MZ.forEach((m,i)=>{displaySpectrum[m]+=(spectrum[m]-displaySpectrum[m])*0.45;const val=displaySpectrum[m];const barH=Math.min(6+val*18,h-12);const barX=x0+16+i*(barW+14);const g=ctx.createLinearGradient(barX,y0-barH,barX+barW,y0);g.addColorStop(0, COLORS[i%COLORS.length]);g.addColorStop(1, '#ffffff');ctx.fillStyle=g;ctx.fillRect(barX,y0-barH,barW,barH);ctx.fillStyle='#64748b';ctx.font='800 12px system-ui';ctx.fillText(m,barX-2,y0+14);ctx.fillStyle='#0f172a';ctx.font='700 11px system-ui';ctx.fillText(Math.round(spectrum[m]),barX+barW/2-4,y0-barH-6);});ctx.restore();}
+function lerp(a,b,t){return a+(b-a)*t;}function quadBezier(p0,p1,p2,t){const u=1-t;return{x:u*u*p0.x+2*u*t*p1.x+t*t*p2.x,y:u*u*p0.y+2*u*t*p1.y+t*t*p2.y};}
+function update(){if(paused) return; tGlobal++;
+ions.forEach((ion,i)=>{
+  if(ion.stage==='inChamber'){
+    const delay=10+(i%5)*8+Math.floor(i/5)*6;
+    if(tGlobal>delay){const tt=Math.min((tGlobal-delay)/40,1);const R=52;ion.x=ion.cx+Math.cos(ion.angle)*R*tt;ion.y=ion.cy+Math.sin(ion.angle)*R*tt;if(tt>=1){ion.stage='toQuad';ion.t=0;}}
+  }
+  else if(ion.stage==='toQuad'){
+    ion.t+=0.035;const t=Math.min(ion.t,1);const sx=ion.x,sy=ion.y;const ex=panels.quad.x+26,ey=panels.quad.y+panels.quad.h/2;const bx=(sx+ex)/2,by=(sy+ey)/2-20;const p1=quadBezier({x:sx,y:sy},{x:bx,y:by},{x:ex,y:ey},t);ion.x=p1.x;ion.y=p1.y;if(t>=1){ion.stage='atQuad';ion.t=0;}}
+  else if(ion.stage==='atQuad'){
+    if(ion.isNoise){ion.stage='unstable';ion.t=0;}
+    else if(ion.mz===currentMz()){ion.stage='throughQuad';ion.t=0;}
+    else {ion.t+=0.06;ion.x=panels.quad.x+26;ion.y=panels.quad.y+panels.quad.h/2+Math.sin(ion.t*3)*4;}
+  }
+  else if(ion.stage==='throughQuad'){
+    // Faster transit for last three m/z
+    const speed = (currentMzIndex < 2) ? 0.02 : 0.05;
+    ion.t+=speed;const t=Math.min(ion.t,1);const qx0=panels.quad.x+26,qx1=panels.quad.x+panels.quad.w-26;const y=panels.quad.y+panels.quad.h/2;ion.x=lerp(qx0,qx1,t);ion.y=y;if(t>=1){ion.stage='toDet';ion.t=0;}}
+  else if(ion.stage==='unstable'){
+    ion.t+=0.045;const t=Math.min(ion.t,1);const qx0=panels.quad.x+26,qx1=panels.quad.x+panels.quad.w-26;const cx=lerp(qx0,qx1,t);const cy=panels.quad.y+panels.quad.h/2;const amp=38;const drift=Math.sin(t*7)*amp;ion.x=cx;ion.y=cy+drift;if(Math.abs(drift)>34||t>=1){addGlow(ion.x,ion.y);ion.alpha=Math.max(0,ion.alpha-0.04);if(ion.alpha<=0.02){ion.stage='lost';}}}
+  else if(ion.stage==='toDet'){
+    // Faster flight to detector for last three m/z
+    const speed = (currentMzIndex < 2) ? 0.045 : 0.08;
+    ion.t+=speed;const t=Math.min(ion.t,1);const sx=ion.x,sy=ion.y;const cx=panels.det.x+panels.det.w/2,cy=panels.det.y+panels.det.h/2;ion.x=lerp(sx,cx,t);ion.y=lerp(sy,cy,t);if(t>=1){ion.stage='counted';spectrum[ion.mz]+=1;}}
+});
+// Auto-cycle windows (first two longer, last three quicker)
+cycleTimer++;if(cycleTimer>=currentCycleFrames()){nextMz();cycleTimer=0;}
+// Auto reset after all base ions counted
+autoTimer=allBaseIonsCounted()?autoTimer+1:0;if(autoTimer>90){resetAll();}}
+function render(){ctx.clearRect(0,0,canvas.width,canvas.height);drawPanel(panels.ion);drawPanel(panels.quad);drawPanel(panels.det);drawPanel(panels.spec);drawMolecules();ions.forEach(i=>{if(['inChamber','toQuad'].includes(i.stage))drawIon(i);});drawQuad();ions.forEach(i=>{if(['atQuad','throughQuad','unstable'].includes(i.stage))drawIon(i);});drawGlows();drawDetector();ions.forEach(i=>{if(['toDet'].includes(i.stage))drawIon(i);});drawSpectrum();}
+function resetAll(){seedSpectrum();createIons();glows=[];currentMzIndex=0;tGlobal=0;cycleTimer=0;autoTimer=0;paused=false;btnToggle.textContent='⏸ Pause';}
+btnToggle.onclick=()=>{paused=!paused;btnToggle.textContent=paused?'▶ Play':'⏸ Pause';if(!paused&&allBaseIonsCounted())resetAll();};
+btnReset.onclick=()=>resetAll();
+resetAll();
+function loop(){update();render();requestAnimationFrame(loop);}loop();
+</script>
+</body>
+</html>
